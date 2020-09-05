@@ -1,0 +1,90 @@
+name: Docker Image CI
+
+on:
+  push:
+    branches:
+      - master
+      - develop
+env:
+  IMAGE_TAG: ${{ github.sha }}
+  DOCKER_BUILDKIT: 1
+  BUILDKIT_PROGRESS: plain
+
+jobs:
+
+  deploy:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+
+# AWS Credentials
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ap-northeast-1
+
+# Login to Amazon ECR
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+# build nginx and push to ECR
+    - name: Build final nginx Docker image
+      run: |
+        docker build -f ./demo/docker/nginx/Dockerfile . -t laravel-demo/nginx:$IMAGE_TAG
+
+    - name: Push final nginx Docker image
+      id: build-image-nginx
+      env:
+        AWS_ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        AWS_ECR_REPOSITORY: ${{ secrets.NGINX_AWS_ECR_REPOSITORY }}
+      run: |
+        docker tag laravel-demo/nginx:$IMAGE_TAG $AWS_ECR_REGISTRY/$AWS_ECR_REPOSITORY:$IMAGE_TAG
+        docker push $AWS_ECR_REGISTRY/$AWS_ECR_REPOSITORY:$IMAGE_TAG
+        echo "::set-output name=image::$AWS_ECR_REGISTRY/$AWS_ECR_REPOSITORY:$IMAGE_TAG"
+
+# build php-fpm and push to ECR
+    - name: Build final php-fpm Docker image
+      run: |
+        docker build -f ./demo/docker/phpfpm/Dockerfile . -t laravel-demo/phpfpm:$IMAGE_TAG --build-arg PRODUCTION=true
+
+    - name: Push php-fpm Docker images
+      id: build-image-php-fpm
+      env:
+        AWS_ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        AWS_ECR_REPOSITORY: ${{ secrets.PHPFPM_AWS_ECR_REPOSITORY }}
+      run: |
+        docker tag laravel-demo/phpfpm:$IMAGE_TAG $AWS_ECR_REGISTRY/$AWS_ECR_REPOSITORY:$IMAGE_TAG
+        docker push $AWS_ECR_REGISTRY/$AWS_ECR_REPOSITORY:$IMAGE_TAG
+        echo "::set-output name=image::$AWS_ECR_REGISTRY/$AWS_ECR_REPOSITORY:$IMAGE_TAG"
+
+# ECS Render task definition: nginx
+    - name: "Render task definition: nginx"
+      id: render-task-definition-nginx
+      uses: aws-actions/amazon-ecs-render-task-definition@v1
+      with:
+        task-definition: ./demo/task-definition.json
+        container-name: nginx
+        image: ${{ steps.build-image-nginx.outputs.image }}
+
+# ECS Render task definition: php-fpm
+    - name: "Render task definition: php-fpm"
+      id: render-task-definition-phpfpm
+      uses: aws-actions/amazon-ecs-render-task-definition@v1
+      with:
+        task-definition: ${{ steps.render-task-definition-nginx.outputs.task-definition }}
+        container-name: php-fpm
+        image: ${{ steps.build-image-php-fpm.outputs.image }}
+
+  # ECS deploy
+    - name: Deploy to Amazon ECS service
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+      with:
+        task-definition: ${{ steps.render-task-definition-phpfpm.outputs.task-definition }}
+        service: laravel-demo-service
+        cluster: laravel-demo
+        wait-for-service-stability: false
